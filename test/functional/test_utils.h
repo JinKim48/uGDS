@@ -64,6 +64,7 @@ static uGDSHandle_t open_handle() {
     uGDSHandle_t fh = nullptr;
     uGDSError_t st = uGDSHandleRegister(&fh, &descr);
     if (st.err != UGDS_SUCCESS) {
+        fprintf(stderr, "uGDSHandleRegister failed: %s\n", uGDS_status_error(st.err));
         close(fd);
         return nullptr;
     }

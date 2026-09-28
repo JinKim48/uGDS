@@ -12,6 +12,7 @@
 #   CUDA_HOME          Optional CUDA toolkit root used to find libcufile.so
 #   CUDA_PATH          Optional CUDA toolkit root used to find libcufile.so
 #   CUDAToolkit_ROOT   Optional CUDA toolkit root used to find libcufile.so
+#   UGDS_FORCE_MKFS=1  Recreate ext4 before mounting in gds mode
 #
 # Examples:
 #   ./scripts/env_switch.sh status
@@ -50,6 +51,11 @@ get_driver() {
     else
         echo "none"
     fi
+}
+
+module_loaded() {
+    local name="$1"
+    awk -v module="$name" '$1 == module {found=1} END {exit found ? 0 : 1}' /proc/modules
 }
 
 get_nvme_dev() {
@@ -182,7 +188,7 @@ cmd_status() {
     else
         echo "  libcufile: NOT FOUND"
     fi
-    if lsmod | grep -q nvidia_fs; then
+    if module_loaded nvidia_fs; then
         echo "  nvidia-fs: loaded"
     else
         echo "  nvidia-fs: not loaded"
@@ -215,7 +221,7 @@ cmd_ugds() {
     unbind_device "$slot"
 
     # Load ugds_drv if not loaded
-    if ! lsmod | grep -q "^ugds_drv "; then
+    if ! module_loaded ugds_drv; then
         [ -f "$UGDS_DRV_MODULE" ] || die "ugds_drv.ko not found at $UGDS_DRV_MODULE (run 'make' in drv/)"
         info "Loading ugds_drv module"
         sudo insmod "$UGDS_DRV_MODULE" max_num_ctrls=64 2>/dev/null || true
@@ -248,7 +254,7 @@ cmd_gds() {
     sleep 1
 
     # Load nvidia-fs if not loaded
-    if ! lsmod | grep -q "^nvidia_fs "; then
+    if ! module_loaded nvidia_fs; then
         info "Loading nvidia-fs module"
         sudo modprobe "$NVIDIA_FS_MODULE" 2>/dev/null || info "WARNING: nvidia-fs failed to load"
     fi
@@ -261,17 +267,25 @@ cmd_gds() {
 
     # Mount if requested
     if [ -n "$mount_point" ]; then
+        if [ "${UGDS_FORCE_MKFS:-0}" = "1" ] && findmnt -n "$nvme_dev" > /dev/null 2>&1; then
+            info "Unmounting $nvme_dev before forced ext4 recreation"
+            sudo umount "$nvme_dev"
+        fi
         if findmnt -n "$nvme_dev" > /dev/null 2>&1; then
             info "$nvme_dev already mounted"
         else
             sudo mkdir -p "$mount_point"
             # Check if filesystem exists
-            if ! sudo blkid "$nvme_dev" > /dev/null 2>&1; then
+            if [ "${UGDS_FORCE_MKFS:-0}" = "1" ]; then
+                info "UGDS_FORCE_MKFS=1, creating ext4 on $nvme_dev"
+                sudo mkfs.ext4 -F "$nvme_dev"
+            elif ! sudo blkid "$nvme_dev" > /dev/null 2>&1; then
                 info "No filesystem on $nvme_dev, creating ext4"
                 sudo mkfs.ext4 -F "$nvme_dev"
             fi
             info "Mounting $nvme_dev at $mount_point"
-            sudo mount -o data=ordered "$nvme_dev" "$mount_point"
+            sudo mount -o noatime,data=ordered "$nvme_dev" "$mount_point"
+            sudo chmod 777 "$mount_point"
         fi
         info "Done. GDS test file: $mount_point/test_data"
     else
