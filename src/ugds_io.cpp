@@ -26,6 +26,25 @@ static uint64_t ugds_profile_now_ns()
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+static int sync_prp_pool_alloc(PRPPool* pool)
+{
+    for (int word = 0; word < UGDS_PRP_POOL_BITMAP_WORDS; ++word) {
+        if (pool->free_bitmap[word] == 0) continue;
+        int bit = __builtin_ctzll(pool->free_bitmap[word]);
+        int idx = word * 64 + bit;
+        if (static_cast<size_t>(idx) >= pool->n_pages)
+            return -1;
+        pool->free_bitmap[word] &= ~(1ULL << bit);
+        return idx;
+    }
+    return -1;
+}
+
+static void sync_prp_pool_free(PRPPool* pool, int idx)
+{
+    pool->free_bitmap[idx / 64] |= (1ULL << (idx % 64));
+}
+
 static nvm_cpl_t* wait_for_completion(HandleState* hs, IOQueuePair& qp)
 {
     if (qp.irq_efd < 0) {
@@ -96,6 +115,44 @@ static nvm_cpl_t* wait_for_completion(HandleState* hs, IOQueuePair& qp)
                 qp.irq_efd, r < 0 ? strerror(errno) : "short read");
         return nullptr;
     }
+}
+
+static int drain_sync_completion(HandleState* hs, IOQueuePair& qp,
+                                 size_t* bytes_done, uint16_t* in_flight,
+                                 uint64_t* profile_wait_ns, bool profile_io)
+{
+    uint64_t profile_wait_start_ns = profile_io ? ugds_profile_now_ns() : 0;
+    nvm_cpl_t* cpl = wait_for_completion(hs, qp);
+    if (profile_io) *profile_wait_ns += ugds_profile_now_ns() - profile_wait_start_ns;
+    if (cpl == nullptr) {
+        return -ETIMEDOUT;
+    }
+
+    uint16_t cid = *NVM_CPL_CID(cpl);
+    uint16_t status = UGDS_CPL_SCT_SC(cpl);
+
+    nvm_sq_update(&qp.sq);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    nvm_cq_update(&qp.cq);
+
+    if (cid >= qp.sync_cmd_map.size() || !qp.sync_cmd_map[cid].active) {
+        fprintf(stderr, "uGDS: unexpected sync completion cid=%u\n", cid);
+        return -EIO;
+    }
+
+    CmdSlot& slot = qp.sync_cmd_map[cid];
+    if (slot.prp_page_idx != UINT16_MAX) {
+        sync_prp_pool_free(&qp.sync_prp_pool, slot.prp_page_idx);
+    }
+    slot.active = false;
+    (*in_flight)--;
+
+    if (status != 0) {
+        return -EIO;
+    }
+
+    *bytes_done += slot.chunk_bytes;
+    return 0;
 }
 
 ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
@@ -201,9 +258,13 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
     uint64_t profile_submit_ns = 0;
     uint64_t profile_wait_ns = 0;
     uint64_t profile_commands = 0;
+    uint16_t profile_window_depth = 1;
+    uint16_t profile_max_in_flight = 1;
 
     {
         std::lock_guard<std::mutex> qp_lock(qp.lock);
+        uint16_t window_depth = 1;
+        uint16_t max_in_flight = 1;
 
         /* Re-check wedged after acquiring QP lock: a previous
          * operation may have timed out while we waited. */
@@ -212,98 +273,259 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
             goto out;
         }
 
-        while (bytes_done < size) {
-            size_t remaining = size - bytes_done;
-            size_t chunk_size = std::min(remaining, max_xfer);
+        if (hs->sync_window_enabled && qp.sync_prp_pool.dma != nullptr &&
+            qp.sync_prp_pool.n_pages > 0 && !qp.sync_cmd_map.empty()) {
+            window_depth = std::min<uint16_t>(
+                hs->sync_window_depth,
+                static_cast<uint16_t>(qp.sq.qs - 1));
+            window_depth = std::min<uint16_t>(
+                window_depth,
+                static_cast<uint16_t>(qp.sync_prp_pool.n_pages));
+            if (window_depth < 2)
+                window_depth = 1;
+        }
+        profile_window_depth = window_depth;
 
-            chunk_size = (chunk_size / hs->block_size) * hs->block_size;
-            if (chunk_size == 0) {
-                result = -EINVAL;
-                goto out;
-            }
+        if (window_depth == 1) {
+            while (bytes_done < size) {
+                size_t remaining = size - bytes_done;
+                size_t chunk_size = std::min(remaining, max_xfer);
 
-            size_t n_blocks = chunk_size / hs->block_size;
-            size_t n_pages = (chunk_size + page_size - 1) / page_size;
-            if (n_pages == 0) n_pages = 1;
+                chunk_size = (chunk_size / hs->block_size) * hs->block_size;
+                if (chunk_size == 0) {
+                    result = -EINVAL;
+                    goto out;
+                }
 
-            nvm_cmd_t* cmd = nullptr;
-            while ((cmd = nvm_sq_enqueue(&qp.sq)) == nullptr) {
-                nvm_cpl_t* drain = wait_for_completion(hs, qp);
-                if (drain == nullptr) {
+                size_t n_blocks = chunk_size / hs->block_size;
+                size_t n_pages = (chunk_size + page_size - 1) / page_size;
+                if (n_pages == 0) n_pages = 1;
+
+                nvm_cmd_t* cmd = nullptr;
+                while ((cmd = nvm_sq_enqueue(&qp.sq)) == nullptr) {
+                    nvm_cpl_t* drain = wait_for_completion(hs, qp);
+                    if (drain == nullptr) {
+                        result = -EIO;
+                        /* An older submitted command may still DMA. Treat this
+                         * exactly like a post-submit completion timeout. */
+                        timed_out = true;
+                        hs->wedged.store(true, std::memory_order_release);
+                        goto out;
+                    }
+                    uint16_t st = UGDS_CPL_SCT_SC(drain);
+                    nvm_sq_update(&qp.sq);
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    nvm_cq_update(&qp.cq);
+                    if (st != 0) {
+                        result = -EIO;
+                        goto out;
+                    }
+                }
+
+                memset(cmd, 0, sizeof(nvm_cmd_t));
+                uint16_t cid = NVM_DEFAULT_CID(&qp.sq);
+                nvm_cmd_header(cmd, cid, opcode, hs->ns_id);
+
+                if (n_pages == 1) {
+                    nvm_cmd_data_ptr(cmd, buf_dma->ioaddrs[current_page], 0);
+                } else if (n_pages == 2) {
+                    nvm_cmd_data_ptr(cmd,
+                                     buf_dma->ioaddrs[current_page],
+                                     buf_dma->ioaddrs[current_page + 1]);
+                } else {
+                    volatile uint64_t* prp_list =
+                        reinterpret_cast<volatile uint64_t*>(qp.prp_dma->vaddr);
+                    for (size_t i = 1; i < n_pages; ++i) {
+                        prp_list[i - 1] = buf_dma->ioaddrs[current_page + i];
+                    }
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    nvm_cmd_data_ptr(cmd,
+                                     buf_dma->ioaddrs[current_page],
+                                     qp.prp_dma->ioaddrs[0]);
+                }
+
+                nvm_cmd_rw_blks(cmd, current_lba, static_cast<uint16_t>(n_blocks));
+
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                uint64_t profile_submit_start_ns = profile_io ? ugds_profile_now_ns() : 0;
+                nvm_sq_submit(&qp.sq);
+                if (profile_io) profile_submit_ns += ugds_profile_now_ns() - profile_submit_start_ns;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+
+                uint64_t profile_wait_start_ns = profile_io ? ugds_profile_now_ns() : 0;
+                nvm_cpl_t* cpl = wait_for_completion(hs, qp);
+                if (profile_io) profile_wait_ns += ugds_profile_now_ns() - profile_wait_start_ns;
+                if (profile_io) ++profile_commands;
+                if (cpl == nullptr) {
                     result = -EIO;
-                    /* An older submitted command may still DMA. Treat this
-                     * exactly like a post-submit completion timeout. */
+                    timed_out = true;
+                    /* Mark wedged while still holding qp.lock to prevent
+                     * QP reuse before the flag is visible. */
+                    hs->wedged.store(true, std::memory_order_release);
+                    goto out;
+                }
+
+                uint16_t status = UGDS_CPL_SCT_SC(cpl);
+
+                nvm_sq_update(&qp.sq);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                nvm_cq_update(&qp.cq);
+
+                if (status != 0) {
+                    result = -EIO;
+                    goto out;
+                }
+
+                bytes_done += chunk_size;
+                current_lba += n_blocks;
+                current_page += n_pages;
+            }
+        } else {
+            size_t submit_bytes = 0;
+            size_t submit_page = current_page;
+            uint64_t submit_lba = current_lba;
+            uint16_t in_flight = 0;
+
+            for (CmdSlot& slot : qp.sync_cmd_map)
+                slot.active = false;
+
+            while (bytes_done < size) {
+                bool submitted = false;
+
+                while (result >= 0 && submit_bytes < size &&
+                       in_flight < window_depth) {
+                    size_t remaining = size - submit_bytes;
+                    size_t chunk_size = std::min(remaining, max_xfer);
+
+                    chunk_size = (chunk_size / hs->block_size) * hs->block_size;
+                    if (chunk_size == 0) {
+                        result = -EINVAL;
+                        break;
+                    }
+
+                    size_t n_blocks = chunk_size / hs->block_size;
+                    size_t n_pages = (chunk_size + page_size - 1) / page_size;
+                    if (n_pages == 0) n_pages = 1;
+
+                    uint16_t prp_idx = UINT16_MAX;
+                    if (n_pages > 2) {
+                        int pidx = sync_prp_pool_alloc(&qp.sync_prp_pool);
+                        if (pidx < 0) {
+                            break;
+                        }
+                        prp_idx = static_cast<uint16_t>(pidx);
+                    }
+
+                    uint16_t slot = static_cast<uint16_t>(
+                        qp.sq.tail.load(std::memory_order_relaxed) % qp.sq.qs);
+                    if (slot >= qp.sync_cmd_map.size() ||
+                        qp.sync_cmd_map[slot].active) {
+                        if (prp_idx != UINT16_MAX)
+                            sync_prp_pool_free(&qp.sync_prp_pool, prp_idx);
+                        result = -EIO;
+                        timed_out = true;
+                        hs->wedged.store(true, std::memory_order_release);
+                        break;
+                    }
+
+                    nvm_cmd_t* cmd = nvm_sq_enqueue(&qp.sq);
+                    if (cmd == nullptr) {
+                        if (prp_idx != UINT16_MAX)
+                            sync_prp_pool_free(&qp.sync_prp_pool, prp_idx);
+                        break;
+                    }
+
+                    memset(cmd, 0, sizeof(nvm_cmd_t));
+                    nvm_cmd_header(cmd, slot, opcode, hs->ns_id);
+
+                    if (n_pages == 1) {
+                        nvm_cmd_data_ptr(cmd, buf_dma->ioaddrs[submit_page], 0);
+                    } else if (n_pages == 2) {
+                        nvm_cmd_data_ptr(cmd,
+                                         buf_dma->ioaddrs[submit_page],
+                                         buf_dma->ioaddrs[submit_page + 1]);
+                    } else {
+                        volatile uint64_t* prp_list =
+                            reinterpret_cast<volatile uint64_t*>(
+                                static_cast<uint8_t*>(qp.sync_prp_pool.buf) +
+                                prp_idx * page_size);
+                        for (size_t i = 1; i < n_pages; ++i) {
+                            prp_list[i - 1] = buf_dma->ioaddrs[submit_page + i];
+                        }
+                        std::atomic_thread_fence(std::memory_order_seq_cst);
+                        nvm_cmd_data_ptr(cmd,
+                                         buf_dma->ioaddrs[submit_page],
+                                         qp.sync_prp_pool.dma->ioaddrs[prp_idx]);
+                    }
+
+                    nvm_cmd_rw_blks(cmd, submit_lba,
+                                    static_cast<uint16_t>(n_blocks));
+
+                    CmdSlot& cs = qp.sync_cmd_map[slot];
+                    cs.io_idx = 0;
+                    cs.chunk_bytes = chunk_size;
+                    cs.prp_page_idx = prp_idx;
+                    cs.active = true;
+
+                    submit_bytes += chunk_size;
+                    submit_lba += n_blocks;
+                    submit_page += n_pages;
+                    ++in_flight;
+                    if (in_flight > max_in_flight)
+                        max_in_flight = in_flight;
+                    ++profile_commands;
+                    submitted = true;
+                }
+
+                if (submitted) {
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    uint64_t profile_submit_start_ns =
+                        profile_io ? ugds_profile_now_ns() : 0;
+                    nvm_sq_submit(&qp.sq);
+                    if (profile_io)
+                        profile_submit_ns +=
+                            ugds_profile_now_ns() - profile_submit_start_ns;
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                }
+
+                if (!submitted && in_flight == 0 && submit_bytes < size &&
+                    result >= 0) {
+                    result = -EIO;
+                    goto out;
+                }
+
+                if (result < 0) {
+                    while (in_flight > 0) {
+                        int rc = drain_sync_completion(hs, qp, &bytes_done,
+                                                       &in_flight,
+                                                       &profile_wait_ns,
+                                                       profile_io);
+                        if (rc == -ETIMEDOUT) {
+                            timed_out = true;
+                            hs->wedged.store(true, std::memory_order_release);
+                            break;
+                        }
+                    }
+                    goto out;
+                }
+
+                if (in_flight == 0)
+                    continue;
+
+                int rc = drain_sync_completion(hs, qp, &bytes_done, &in_flight,
+                                               &profile_wait_ns, profile_io);
+                if (rc == -ETIMEDOUT) {
+                    result = -EIO;
                     timed_out = true;
                     hs->wedged.store(true, std::memory_order_release);
                     goto out;
                 }
-                uint16_t st = UGDS_CPL_SCT_SC(drain);
-                nvm_sq_update(&qp.sq);
-                std::atomic_thread_fence(std::memory_order_seq_cst);
-                nvm_cq_update(&qp.cq);
-                if (st != 0) {
+                if (rc != 0) {
                     result = -EIO;
-                    goto out;
                 }
             }
 
-            memset(cmd, 0, sizeof(nvm_cmd_t));
-            uint16_t cid = NVM_DEFAULT_CID(&qp.sq);
-            nvm_cmd_header(cmd, cid, opcode, hs->ns_id);
-
-            if (n_pages == 1) {
-                nvm_cmd_data_ptr(cmd, buf_dma->ioaddrs[current_page], 0);
-            } else if (n_pages == 2) {
-                nvm_cmd_data_ptr(cmd,
-                                 buf_dma->ioaddrs[current_page],
-                                 buf_dma->ioaddrs[current_page + 1]);
-            } else {
-                volatile uint64_t* prp_list =
-                    reinterpret_cast<volatile uint64_t*>(qp.prp_dma->vaddr);
-                for (size_t i = 1; i < n_pages; ++i) {
-                    prp_list[i - 1] = buf_dma->ioaddrs[current_page + i];
-                }
-                std::atomic_thread_fence(std::memory_order_seq_cst);
-                nvm_cmd_data_ptr(cmd,
-                                 buf_dma->ioaddrs[current_page],
-                                 qp.prp_dma->ioaddrs[0]);
-            }
-
-            nvm_cmd_rw_blks(cmd, current_lba, static_cast<uint16_t>(n_blocks));
-
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            uint64_t profile_submit_start_ns = profile_io ? ugds_profile_now_ns() : 0;
-            nvm_sq_submit(&qp.sq);
-            if (profile_io) profile_submit_ns += ugds_profile_now_ns() - profile_submit_start_ns;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-
-            uint64_t profile_wait_start_ns = profile_io ? ugds_profile_now_ns() : 0;
-            nvm_cpl_t* cpl = wait_for_completion(hs, qp);
-            if (profile_io) profile_wait_ns += ugds_profile_now_ns() - profile_wait_start_ns;
-            if (profile_io) ++profile_commands;
-            if (cpl == nullptr) {
-                result = -EIO;
-                timed_out = true;
-                /* Mark wedged while still holding qp.lock to prevent
-                 * QP reuse before the flag is visible. */
-                hs->wedged.store(true, std::memory_order_release);
-                goto out;
-            }
-
-            uint16_t status = UGDS_CPL_SCT_SC(cpl);
-
-            nvm_sq_update(&qp.sq);
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            nvm_cq_update(&qp.cq);
-
-            if (status != 0) {
-                result = -EIO;
-                goto out;
-            }
-
-            bytes_done += chunk_size;
-            current_lba += n_blocks;
-            current_page += n_pages;
+            profile_max_in_flight = max_in_flight;
         }
 
         result = static_cast<ssize_t>(bytes_done);
@@ -344,7 +566,8 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
         fprintf(stderr,
                 "UGDS_PROFILE_IO op=%s size=%zu file_offset=%lld buf_offset=%lld "
                 "max_xfer=%zu commands=%llu qp=%u result=%zd total_us=%.3f "
-                "submit_us=%.3f wait_us=%.3f on_the_fly=%d interrupt=%d\n",
+                "submit_us=%.3f wait_us=%.3f on_the_fly=%d interrupt=%d "
+                "window_depth=%u max_in_flight=%u\n",
                 opcode == NVM_IO_READ ? "read" : "write",
                 size,
                 (long long)file_offset,
@@ -357,7 +580,9 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                 (double)profile_submit_ns / 1000.0,
                 (double)profile_wait_ns / 1000.0,
                 on_the_fly ? 1 : 0,
-                hs->interrupt_mode ? 1 : 0);
+                hs->interrupt_mode ? 1 : 0,
+                (unsigned)profile_window_depth,
+                (unsigned)profile_max_in_flight);
     }
 
     return result;

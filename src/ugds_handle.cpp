@@ -30,9 +30,76 @@ static void cleanup_qp(nvm_aq_ref aq_ref, IOQueuePair* qp, int dev_fd) {
         qp->irq_efd = -1;
     }
     if (qp->prp_dma) nvm_dma_unmap(qp->prp_dma);
+    if (qp->sync_prp_pool.dma) nvm_dma_unmap(qp->sync_prp_pool.dma);
+    free(qp->sync_prp_pool.buf);
+    qp->sync_prp_pool.dma = nullptr;
+    qp->sync_prp_pool.buf = nullptr;
+    qp->sync_prp_pool.n_pages = 0;
     free(qp->sq_buf);
     free(qp->cq_buf);
     free(qp->prp_buf);
+}
+
+static bool env_truthy(const char* name)
+{
+    const char* env = getenv(name);
+    return env != nullptr && env[0] != '\0' &&
+        strcmp(env, "0") != 0 &&
+        strcmp(env, "off") != 0 &&
+        strcmp(env, "false") != 0 &&
+        strcmp(env, "no") != 0;
+}
+
+static uint16_t parse_sync_window_depth(uint16_t max_depth)
+{
+    const char* env = getenv("UGDS_SYNC_IO_WINDOW_DEPTH");
+    if (env == nullptr || env[0] == '\0') {
+        return std::min<uint16_t>(
+            static_cast<uint16_t>(UGDS_DEFAULT_SYNC_WINDOW_DEPTH),
+            max_depth);
+    }
+
+    char* end = nullptr;
+    unsigned long value = strtoul(env, &end, 10);
+    if (end == env || value <= 1) {
+        return 1;
+    }
+    if (value > max_depth) {
+        value = max_depth;
+    }
+    return static_cast<uint16_t>(value);
+}
+
+static bool init_prp_pool(PRPPool* pool, HandleState* hs, size_t n_pages)
+{
+    const size_t page_size = hs->ctrl->page_size;
+    const size_t pool_bytes = n_pages * page_size;
+
+    if (n_pages == 0 || n_pages > UGDS_PRP_POOL_PAGES)
+        return false;
+    if (posix_memalign(&pool->buf, 4096, pool_bytes) != 0)
+        return false;
+    std::memset(pool->buf, 0, pool_bytes);
+
+    int status = nvm_dma_map_host(&pool->dma, hs->ctrl, pool->buf, pool_bytes);
+    if (!nvm_ok(status)) {
+        free(pool->buf);
+        pool->buf = nullptr;
+        return false;
+    }
+
+    pool->n_pages = n_pages;
+    for (int word = 0; word < UGDS_PRP_POOL_BITMAP_WORDS; ++word) {
+        size_t start = static_cast<size_t>(word) * 64;
+        if (start >= pool->n_pages) {
+            pool->free_bitmap[word] = 0;
+            continue;
+        }
+        size_t bits = std::min<size_t>(64, pool->n_pages - start);
+        pool->free_bitmap[word] = bits == 64 ? ~0ULL : (1ULL << bits) - 1;
+    }
+
+    return true;
 }
 
 static void cleanup_batch_qp(nvm_aq_ref aq_ref, IOQueuePairHuge* bqp, int dev_fd) {
@@ -167,6 +234,15 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
     uint16_t total_qps = std::min<uint16_t>(avail, UGDS_DEFAULT_NUM_QPS);
     uint16_t sync_qps = total_qps - 1;
     hs->num_qps = sync_qps;
+    const uint16_t max_sync_window_depth = std::min<uint16_t>(
+        static_cast<uint16_t>(UGDS_DEFAULT_QUEUE_DEPTH - 1),
+        static_cast<uint16_t>(UGDS_SYNC_PRP_POOL_PAGES));
+    const bool sync_window_depth_set =
+        getenv("UGDS_SYNC_IO_WINDOW_DEPTH") != nullptr;
+    hs->sync_window_depth = parse_sync_window_depth(max_sync_window_depth);
+    hs->sync_window_enabled =
+        env_truthy("UGDS_SYNC_IO_WINDOW") ||
+        (sync_window_depth_set && hs->sync_window_depth > 1);
 
     uint16_t irq_vectors = 0;
     {
@@ -240,6 +316,13 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
         std::memset(qp->prp_buf, 0, page_size);
         status = nvm_dma_map_host(&qp->prp_dma, hs->ctrl, qp->prp_buf, page_size);
         if (!nvm_ok(status)) goto fail;
+
+        if (hs->sync_window_enabled) {
+            if (!init_prp_pool(&qp->sync_prp_pool, hs.get(),
+                               hs->sync_window_depth))
+                goto fail;
+            qp->sync_cmd_map.resize(UGDS_DEFAULT_QUEUE_DEPTH);
+        }
 
         hs->qps.push_back(std::move(qp));
         continue;

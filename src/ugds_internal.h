@@ -28,6 +28,8 @@
 #define UGDS_MAX_BATCH_IO_SIZE   128
 #define UGDS_PRP_POOL_PAGES      128
 #define UGDS_PRP_POOL_BITMAP_WORDS ((UGDS_PRP_POOL_PAGES + 63) / 64)
+#define UGDS_SYNC_PRP_POOL_PAGES (UGDS_DEFAULT_QUEUE_DEPTH - 1)
+#define UGDS_DEFAULT_SYNC_WINDOW_DEPTH 16
 #define UGDS_HUGEPAGE_SIZE       (2UL * 1024 * 1024)
 
 /* Fallback maximum data-transfer size (bytes) for a single I/O when the controller
@@ -36,6 +38,20 @@
 
 /* SCT+SC (11-bit) from an NVMe completion: 0 = success. See NVMe Base Spec section 4.6.1. */
 #define UGDS_CPL_SCT_SC(cpl)     (((cpl)->dword[3] >> 17) & 0x7FF)
+
+struct PRPPool {
+    nvm_dma_t*  dma       = nullptr;
+    void*       buf       = nullptr;
+    size_t      n_pages   = 0;
+    uint64_t    free_bitmap[UGDS_PRP_POOL_BITMAP_WORDS] = {};
+};
+
+struct CmdSlot {
+    uint16_t    io_idx      = 0;
+    size_t      chunk_bytes = 0;
+    uint16_t    prp_page_idx = UINT16_MAX;
+    bool        active      = false;
+};
 
 struct IOQueuePair {
     nvm_queue_t    sq{};
@@ -48,6 +64,8 @@ struct IOQueuePair {
     void*          prp_buf = nullptr;
     int            irq_efd = -1;   /* eventfd for interrupt mode; -1 = poll */
     uint16_t       irq_vec = 0;    /* MSI-X vector bound to this CQ */
+    PRPPool        sync_prp_pool;
+    std::vector<CmdSlot> sync_cmd_map;
     /* Timeout resources remain owned by the QP until controller recovery.
      * At most one synchronous operation can hold this QP lock. */
     nvm_dma_t*     timeout_dma = nullptr;           /* on-the-fly mapping */
@@ -81,6 +99,8 @@ struct HandleState {
     std::unique_ptr<IOQueuePairHuge> batch_qp;
     uint16_t                    batch_queue_depth;
     std::atomic<bool>           batch_active{false};
+    bool                        sync_window_enabled = false;
+    uint16_t                    sync_window_depth = 1;
     bool                        interrupt_mode = false;  /* UGDS_INTERRUPT_MODE */
     std::atomic<bool>           wedged{false};          /* batch timeout: handle poisoned, controller reset required */
     std::atomic<uint32_t>       handle_in_flight{0};  /* IO refcount for safe deregister */
@@ -174,20 +194,6 @@ static inline HandleState* handle_lookup_locked(uGDSHandle_t fh,
 static inline void handle_release(HandleState* hs) {
     hs->handle_in_flight.fetch_sub(1, std::memory_order_acq_rel);
 }
-
-struct PRPPool {
-    nvm_dma_t*  dma       = nullptr;
-    void*       buf       = nullptr;
-    size_t      n_pages   = 0;
-    uint64_t    free_bitmap[UGDS_PRP_POOL_BITMAP_WORDS] = {};
-};
-
-struct CmdSlot {
-    uint16_t    io_idx      = 0;
-    size_t      chunk_bytes = 0;
-    uint16_t    prp_page_idx = UINT16_MAX;
-    bool        active      = false;
-};
 
 struct BatchIOEntry {
     void*               cookie        = nullptr;
