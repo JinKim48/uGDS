@@ -5,9 +5,26 @@
 #include <cerrno>
 #include <atomic>
 #include <algorithm>
+#include <cstdlib>
 #include <poll.h>
 #include <unistd.h>
 #include <time.h>
+
+static bool ugds_profile_io_enabled()
+{
+    static int enabled = []() {
+        const char* v = getenv("UGDS_PROFILE_IO");
+        return (v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0) ? 1 : 0;
+    }();
+    return enabled != 0;
+}
+
+static uint64_t ugds_profile_now_ns()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 static nvm_cpl_t* wait_for_completion(HandleState* hs, IOQueuePair& qp)
 {
@@ -179,6 +196,11 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
     size_t bytes_done = 0;
     uint64_t current_lba = start_lba;
     size_t current_page = buf_page_start;
+    const bool profile_io = ugds_profile_io_enabled();
+    const uint64_t profile_start_ns = profile_io ? ugds_profile_now_ns() : 0;
+    uint64_t profile_submit_ns = 0;
+    uint64_t profile_wait_ns = 0;
+    uint64_t profile_commands = 0;
 
     {
         std::lock_guard<std::mutex> qp_lock(qp.lock);
@@ -250,10 +272,15 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
             nvm_cmd_rw_blks(cmd, current_lba, static_cast<uint16_t>(n_blocks));
 
             std::atomic_thread_fence(std::memory_order_seq_cst);
+            uint64_t profile_submit_start_ns = profile_io ? ugds_profile_now_ns() : 0;
             nvm_sq_submit(&qp.sq);
+            if (profile_io) profile_submit_ns += ugds_profile_now_ns() - profile_submit_start_ns;
             std::atomic_thread_fence(std::memory_order_seq_cst);
 
+            uint64_t profile_wait_start_ns = profile_io ? ugds_profile_now_ns() : 0;
             nvm_cpl_t* cpl = wait_for_completion(hs, qp);
+            if (profile_io) profile_wait_ns += ugds_profile_now_ns() - profile_wait_start_ns;
+            if (profile_io) ++profile_commands;
             if (cpl == nullptr) {
                 result = -EIO;
                 timed_out = true;
@@ -310,6 +337,27 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
         auto it = g_driver.buf_registry.find(bufPtr_base);
         if (it != g_driver.buf_registry.end())
             it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    if (profile_io) {
+        const uint64_t total_ns = ugds_profile_now_ns() - profile_start_ns;
+        fprintf(stderr,
+                "UGDS_PROFILE_IO op=%s size=%zu file_offset=%lld buf_offset=%lld "
+                "max_xfer=%zu commands=%llu qp=%u result=%zd total_us=%.3f "
+                "submit_us=%.3f wait_us=%.3f on_the_fly=%d interrupt=%d\n",
+                opcode == NVM_IO_READ ? "read" : "write",
+                size,
+                (long long)file_offset,
+                (long long)bufPtr_offset,
+                max_xfer,
+                (unsigned long long)profile_commands,
+                (unsigned)qp_idx,
+                result,
+                (double)total_ns / 1000.0,
+                (double)profile_submit_ns / 1000.0,
+                (double)profile_wait_ns / 1000.0,
+                on_the_fly ? 1 : 0,
+                hs->interrupt_mode ? 1 : 0);
     }
 
     return result;
