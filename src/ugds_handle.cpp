@@ -322,6 +322,9 @@ extern "C" uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr)
                                hs->sync_window_depth))
                 goto fail;
             qp->sync_cmd_map.resize(UGDS_DEFAULT_QUEUE_DEPTH);
+            qp->sync_free_cids.reserve(UGDS_DEFAULT_QUEUE_DEPTH - 1);
+            for (unsigned cid = UGDS_DEFAULT_QUEUE_DEPTH - 1; cid > 0; --cid)
+                qp->sync_free_cids.push_back(static_cast<uint16_t>(cid - 1));
         }
 
         hs->qps.push_back(std::move(qp));

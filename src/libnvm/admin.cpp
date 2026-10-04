@@ -505,4 +505,3 @@ int nvm_admin_request_num_queues(nvm_aq_ref ref, uint16_t* n_cqs, uint16_t* n_sq
 
     return NVM_ERR_PACK(NULL, 0);
 }
-

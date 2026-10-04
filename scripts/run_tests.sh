@@ -154,6 +154,7 @@ run_functional() {
         test_buf_register
         test_read_write_basic
         test_read_write_large
+        test_sync_window_wrap
         test_read_write_unregistered
         test_alignment_errors
         test_multi_offset

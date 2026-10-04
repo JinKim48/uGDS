@@ -66,6 +66,7 @@ struct IOQueuePair {
     uint16_t       irq_vec = 0;    /* MSI-X vector bound to this CQ */
     PRPPool        sync_prp_pool;
     std::vector<CmdSlot> sync_cmd_map;
+    std::vector<uint16_t> sync_free_cids;
     /* Timeout resources remain owned by the QP until controller recovery.
      * At most one synchronous operation can hold this QP lock. */
     nvm_dma_t*     timeout_dma = nullptr;           /* on-the-fly mapping */

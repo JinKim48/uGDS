@@ -47,19 +47,11 @@ static void sync_prp_pool_free(PRPPool* pool, int idx)
 
 static nvm_cpl_t* wait_for_completion(HandleState* hs, IOQueuePair& qp)
 {
-    if (qp.irq_efd < 0) {
-        nvm_cpl_t* cpl = nullptr;
-        uint64_t spins = 0;
-        const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
-        while ((cpl = nvm_cq_dequeue(&qp.cq)) == nullptr) {
-            if (++spins > max_spins) break;
-            __builtin_ia32_pause();
-        }
-        return cpl;
-    }
-
-    // Absolute deadline prevents EINTR restarts from stretching total wait.
-    const long timeout_ms = (long)hs->ctrl->timeout;
+    /* CAP.TO describes controller-ready transitions and may legally be zero.
+     * uGDS historically reused it as the I/O completion timeout, which made
+     * CAP.TO=0 controllers fail on the first CQ poll that was not immediately
+     * ready. Keep a conservative floor for the I/O path. */
+    const uint64_t timeout_ms = std::max<uint64_t>(hs->ctrl->timeout, 500ULL);
     struct timespec deadline;
     clock_gettime(CLOCK_MONOTONIC, &deadline);
     deadline.tv_sec += timeout_ms / 1000;
@@ -69,6 +61,27 @@ static nvm_cpl_t* wait_for_completion(HandleState* hs, IOQueuePair& qp)
         deadline.tv_nsec -= 1000000000L;
     }
 
+    if (qp.irq_efd < 0) {
+        nvm_cpl_t* cpl = nullptr;
+        uint32_t spins = 0;
+        while ((cpl = nvm_cq_dequeue(&qp.cq)) == nullptr) {
+            /* Clock reads on every iteration materially hurt the hot polling
+             * path.  Check periodically, but measure a real deadline instead
+             * of assuming a fixed number of CPU spins per millisecond. */
+            if ((++spins & 0xfffU) == 0) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                if (now.tv_sec > deadline.tv_sec ||
+                    (now.tv_sec == deadline.tv_sec &&
+                     now.tv_nsec >= deadline.tv_nsec))
+                    break;
+            }
+            __builtin_ia32_pause();
+        }
+        return cpl;
+    }
+
+    // Absolute deadline prevents EINTR restarts from stretching total wait.
     for (;;) {
         // Poll CQ before blocking to prevent lost wakeups.
         nvm_cpl_t* cpl = nvm_cq_dequeue(&qp.cq);
@@ -130,13 +143,19 @@ static int drain_sync_completion(HandleState* hs, IOQueuePair& qp,
 
     uint16_t cid = *NVM_CPL_CID(cpl);
     uint16_t status = UGDS_CPL_SCT_SC(cpl);
+    uint16_t sq_head = *NVM_CPL_SQHD(cpl);
 
-    nvm_sq_update(&qp.sq);
+    bool valid = cid < qp.sync_cmd_map.size() &&
+                 qp.sync_cmd_map[cid].active && sq_head < qp.sq.qs;
+    if (valid)
+        qp.sq.head.store(sq_head, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_seq_cst);
     nvm_cq_update(&qp.cq);
 
-    if (cid >= qp.sync_cmd_map.size() || !qp.sync_cmd_map[cid].active) {
-        fprintf(stderr, "uGDS: unexpected sync completion cid=%u\n", cid);
+    if (!valid) {
+        fprintf(stderr,
+                "uGDS: invalid sync completion (CID %u, SQHD %u, depth %u)\n",
+                cid, sq_head, qp.sq.qs);
         return -EIO;
     }
 
@@ -145,6 +164,7 @@ static int drain_sync_completion(HandleState* hs, IOQueuePair& qp,
         sync_prp_pool_free(&qp.sync_prp_pool, slot.prp_page_idx);
     }
     slot.active = false;
+    qp.sync_free_cids.push_back(cid);
     (*in_flight)--;
 
     if (status != 0) {
@@ -386,9 +406,6 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
             uint64_t submit_lba = current_lba;
             uint16_t in_flight = 0;
 
-            for (CmdSlot& slot : qp.sync_cmd_map)
-                slot.active = false;
-
             while (bytes_done < size) {
                 bool submitted = false;
 
@@ -416,15 +433,9 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                         prp_idx = static_cast<uint16_t>(pidx);
                     }
 
-                    uint16_t slot = static_cast<uint16_t>(
-                        qp.sq.tail.load(std::memory_order_relaxed) % qp.sq.qs);
-                    if (slot >= qp.sync_cmd_map.size() ||
-                        qp.sync_cmd_map[slot].active) {
+                    if (qp.sync_free_cids.empty()) {
                         if (prp_idx != UINT16_MAX)
                             sync_prp_pool_free(&qp.sync_prp_pool, prp_idx);
-                        result = -EIO;
-                        timed_out = true;
-                        hs->wedged.store(true, std::memory_order_release);
                         break;
                     }
 
@@ -435,8 +446,10 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                         break;
                     }
 
+                    uint16_t cid = qp.sync_free_cids.back();
+                    qp.sync_free_cids.pop_back();
                     memset(cmd, 0, sizeof(nvm_cmd_t));
-                    nvm_cmd_header(cmd, slot, opcode, hs->ns_id);
+                    nvm_cmd_header(cmd, cid, opcode, hs->ns_id);
 
                     if (n_pages == 1) {
                         nvm_cmd_data_ptr(cmd, buf_dma->ioaddrs[submit_page], 0);
@@ -461,7 +474,7 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                     nvm_cmd_rw_blks(cmd, submit_lba,
                                     static_cast<uint16_t>(n_blocks));
 
-                    CmdSlot& cs = qp.sync_cmd_map[slot];
+                    CmdSlot& cs = qp.sync_cmd_map[cid];
                     cs.io_idx = 0;
                     cs.chunk_bytes = chunk_size;
                     cs.prp_page_idx = prp_idx;
@@ -500,8 +513,8 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                                                        &in_flight,
                                                        &profile_wait_ns,
                                                        profile_io);
-                        if (rc == -ETIMEDOUT) {
-                            timed_out = true;
+                        if (rc != 0) {
+                            timed_out = rc == -ETIMEDOUT;
                             hs->wedged.store(true, std::memory_order_release);
                             break;
                         }
