@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <unistd.h>
 #include <time.h>
+#include <mutex>
 
 static bool ugds_profile_io_enabled()
 {
@@ -278,11 +279,26 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
     uint64_t profile_submit_ns = 0;
     uint64_t profile_wait_ns = 0;
     uint64_t profile_commands = 0;
+    uint64_t profile_doorbells = 0;
+    uint64_t profile_completion_drains = 0;
+    uint64_t profile_refill_rounds = 0;
+    uint64_t profile_qd_wait_ns = 0;
+    uint64_t profile_qd_wait_weighted = 0;
+    uint64_t profile_full_wait_ns = 0;
+    uint64_t profile_underfilled_wait_ns = 0;
+    uint64_t profile_lock_wait_ns = 0;
+    uint64_t profile_lock_hold_ns = 0;
     uint16_t profile_window_depth = 1;
     uint16_t profile_max_in_flight = 1;
 
     {
-        std::lock_guard<std::mutex> qp_lock(qp.lock);
+        const uint64_t profile_lock_start_ns =
+            profile_io ? ugds_profile_now_ns() : 0;
+        std::unique_lock<std::mutex> qp_lock(qp.lock);
+        const uint64_t profile_lock_acquired_ns =
+            profile_io ? ugds_profile_now_ns() : 0;
+        if (profile_io)
+            profile_lock_wait_ns = profile_lock_acquired_ns - profile_lock_start_ns;
         uint16_t window_depth = 1;
         uint16_t max_in_flight = 1;
 
@@ -369,13 +385,21 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 uint64_t profile_submit_start_ns = profile_io ? ugds_profile_now_ns() : 0;
                 nvm_sq_submit(&qp.sq);
+                if (profile_io) ++profile_doorbells;
                 if (profile_io) profile_submit_ns += ugds_profile_now_ns() - profile_submit_start_ns;
                 std::atomic_thread_fence(std::memory_order_seq_cst);
 
                 uint64_t profile_wait_start_ns = profile_io ? ugds_profile_now_ns() : 0;
                 nvm_cpl_t* cpl = wait_for_completion(hs, qp);
                 if (profile_io) profile_wait_ns += ugds_profile_now_ns() - profile_wait_start_ns;
-                if (profile_io) ++profile_commands;
+                if (profile_io) {
+                    ++profile_commands;
+                    ++profile_completion_drains;
+                    const uint64_t wait_delta = ugds_profile_now_ns() - profile_wait_start_ns;
+                    profile_qd_wait_ns += wait_delta;
+                    profile_qd_wait_weighted += wait_delta;
+                    profile_full_wait_ns += wait_delta;
+                }
                 if (cpl == nullptr) {
                     result = -EIO;
                     timed_out = true;
@@ -491,10 +515,12 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                 }
 
                 if (submitted) {
+                    if (profile_io) ++profile_refill_rounds;
                     std::atomic_thread_fence(std::memory_order_seq_cst);
                     uint64_t profile_submit_start_ns =
                         profile_io ? ugds_profile_now_ns() : 0;
                     nvm_sq_submit(&qp.sq);
+                    if (profile_io) ++profile_doorbells;
                     if (profile_io)
                         profile_submit_ns +=
                             ugds_profile_now_ns() - profile_submit_start_ns;
@@ -525,8 +551,20 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                 if (in_flight == 0)
                     continue;
 
+                const uint16_t qd_before_wait = in_flight;
+                const uint64_t wait_before = profile_wait_ns;
                 int rc = drain_sync_completion(hs, qp, &bytes_done, &in_flight,
                                                &profile_wait_ns, profile_io);
+                if (profile_io) {
+                    ++profile_completion_drains;
+                    const uint64_t wait_delta = profile_wait_ns - wait_before;
+                    profile_qd_wait_ns += wait_delta;
+                    profile_qd_wait_weighted += wait_delta * qd_before_wait;
+                    if (qd_before_wait == window_depth)
+                        profile_full_wait_ns += wait_delta;
+                    else
+                        profile_underfilled_wait_ns += wait_delta;
+                }
                 if (rc == -ETIMEDOUT) {
                     result = -EIO;
                     timed_out = true;
@@ -556,7 +594,9 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
             buf_dma = nullptr;
         }
 
-    out:;
+    out:
+        if (profile_io)
+            profile_lock_hold_ns = ugds_profile_now_ns() - profile_lock_acquired_ns;
     }
 
     if (timed_out) {
@@ -580,7 +620,10 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                 "UGDS_PROFILE_IO op=%s size=%zu file_offset=%lld buf_offset=%lld "
                 "max_xfer=%zu commands=%llu qp=%u result=%zd total_us=%.3f "
                 "submit_us=%.3f wait_us=%.3f on_the_fly=%d interrupt=%d "
-                "window_depth=%u max_in_flight=%u\n",
+                "window_depth=%u max_in_flight=%u doorbells=%llu "
+                "completion_drains=%llu refill_rounds=%llu lock_wait_us=%.3f "
+                "lock_hold_us=%.3f wait_qd_avg=%.3f full_wait_us=%.3f "
+                "underfilled_wait_us=%.3f\n",
                 opcode == NVM_IO_READ ? "read" : "write",
                 size,
                 (long long)file_offset,
@@ -595,7 +638,16 @@ ssize_t do_io_internal(uGDSHandle_t fh, void* bufPtr_base, size_t size,
                 on_the_fly ? 1 : 0,
                 hs->interrupt_mode ? 1 : 0,
                 (unsigned)profile_window_depth,
-                (unsigned)profile_max_in_flight);
+                (unsigned)profile_max_in_flight,
+                (unsigned long long)profile_doorbells,
+                (unsigned long long)profile_completion_drains,
+                (unsigned long long)profile_refill_rounds,
+                (double)profile_lock_wait_ns / 1000.0,
+                (double)profile_lock_hold_ns / 1000.0,
+                profile_qd_wait_ns == 0 ? 0.0 :
+                    (double)profile_qd_wait_weighted / (double)profile_qd_wait_ns,
+                (double)profile_full_wait_ns / 1000.0,
+                (double)profile_underfilled_wait_ns / 1000.0);
     }
 
     return result;
