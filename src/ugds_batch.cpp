@@ -43,17 +43,29 @@ static void prp_pool_free(PRPPool* pool, int idx)
     pool->free_bitmap[idx / 64] |= (1ULL << (idx % 64));
 }
 
-static bool drain_one_completion(IOQueuePair& qp, BatchState* bs)
+static int drain_one_completion(IOQueuePair& qp, BatchState* bs)
 {
     nvm_cpl_t* cpl = nvm_cq_dequeue(&qp.cq);
-    if (!cpl) return false;
+    if (!cpl) return 0;
 
     uint16_t cid = *NVM_CPL_CID(cpl);
     uint16_t status = UGDS_CPL_SCT_SC(cpl);
+    uint16_t sq_head = *NVM_CPL_SQHD(cpl);
 
-    nvm_sq_update(&qp.sq);
+    bool valid = cid < bs->cmd_map.size() &&
+                 bs->cmd_map[cid].active && sq_head < qp.sq.qs;
+    if (valid)
+        qp.sq.head.store(sq_head, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_seq_cst);
     nvm_cq_update(&qp.cq);
+
+    if (!valid) {
+        fprintf(stderr,
+                "uGDS: invalid batch completion (CID %u, SQHD %u, depth %u)\n",
+                cid, sq_head, qp.sq.qs);
+        bs->hs->wedged.store(true, std::memory_order_release);
+        return -EIO;
+    }
 
     CmdSlot& slot = bs->cmd_map[cid];
     BatchIOEntry& entry = bs->entries[slot.io_idx];
@@ -68,6 +80,7 @@ static bool drain_one_completion(IOQueuePair& qp, BatchState* bs)
         prp_pool_free(&bs->prp_pool, slot.prp_page_idx);
     }
     slot.active = false;
+    bs->free_cids.push_back(cid);
     bs->in_flight--;
 
     entry.n_cmds_done++;
@@ -82,7 +95,7 @@ static bool drain_one_completion(IOQueuePair& qp, BatchState* bs)
         async_release_inflight_batch(entry.devPtr_base);
     }
 
-    return true;
+    return 1;
 }
 
 static size_t compute_max_xfer(HandleState* hs)
@@ -138,6 +151,9 @@ extern "C" uGDSError_t uGDSBatchIOSetUp(uGDSBatchHandle_t* batch,
     bs->hs_sp = std::move(hs_sp);  /* keep handle alive for batch lifetime */
     bs->entries.resize(nr);
     bs->cmd_map.resize(hs->batch_queue_depth);
+    bs->free_cids.reserve(hs->batch_queue_depth - 1);
+    for (unsigned cid = hs->batch_queue_depth - 1; cid > 0; --cid)
+        bs->free_cids.push_back(static_cast<uint16_t>(cid - 1));
 
     const size_t page_size = hs->ctrl->page_size;
     PRPPool& pool = bs->prp_pool;
@@ -341,7 +357,20 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                     uint64_t spins = 0;
                     const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
                     while ((pidx = prp_pool_alloc(&bs->prp_pool)) < 0) {
-                        if (!drain_one_completion(qp, bs)) {
+                        int drain_rc = drain_one_completion(qp, bs);
+                        if (drain_rc < 0) {
+                            for (unsigned i = 0; i < nr; ++i) {
+                                BatchIOEntry& e = bs->entries[base + i];
+                                if (e.status == UGDS_BATCH_WAITING) {
+                                    async_release_inflight_batch(e.devPtr_base);
+                                    e.status = UGDS_BATCH_FAILED;
+                                    e.n_cmds = 0;
+                                }
+                            }
+                            bs->n_entries += nr;
+                            return make_error(UGDS_INTERNAL_ERROR);
+                        }
+                        if (drain_rc == 0) {
                             if (++spins > max_spins) {
                                 /* Release in_flight refs only for entries
                                  * that are still WAITING (ref acquired but
@@ -367,8 +396,35 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                 prp_idx = static_cast<uint16_t>(pidx);
             }
 
-            uint16_t slot = static_cast<uint16_t>(
-                qp.sq.tail.load(std::memory_order_relaxed) % qp.sq.qs);
+            if (bs->free_cids.empty()) {
+                nvm_sq_submit(&qp.sq);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+
+                uint64_t spins = 0;
+                const uint64_t max_spins =
+                    (uint64_t)hs->ctrl->timeout * 1000000ULL;
+                while (bs->free_cids.empty()) {
+                    int drain_rc = drain_one_completion(qp, bs);
+                    if (drain_rc < 0 ||
+                        (drain_rc == 0 && ++spins > max_spins)) {
+                        if (prp_idx != UINT16_MAX)
+                            prp_pool_free(&bs->prp_pool, prp_idx);
+                        for (unsigned i = 0; i < nr; ++i) {
+                            BatchIOEntry& e = bs->entries[base + i];
+                            if (e.status == UGDS_BATCH_WAITING) {
+                                async_release_inflight_batch(e.devPtr_base);
+                                e.status = UGDS_BATCH_FAILED;
+                                e.n_cmds = 0;
+                            }
+                        }
+                        bs->n_entries += nr;
+                        return make_error(UGDS_INTERNAL_ERROR);
+                    }
+                    if (drain_rc == 0)
+                        __builtin_ia32_pause();
+                }
+            }
+
             nvm_cmd_t* cmd = nvm_sq_enqueue(&qp.sq);
 
             if (cmd == nullptr) {
@@ -379,8 +435,22 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                 const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
                 bool drained = false;
                 while (!drained) {
-                    if (drain_one_completion(qp, bs)) {
+                    int drain_rc = drain_one_completion(qp, bs);
+                    if (drain_rc > 0) {
                         drained = true;
+                    } else if (drain_rc < 0) {
+                        if (prp_idx != UINT16_MAX)
+                            prp_pool_free(&bs->prp_pool, prp_idx);
+                        for (unsigned i = 0; i < nr; ++i) {
+                            BatchIOEntry& e = bs->entries[base + i];
+                            if (e.status == UGDS_BATCH_WAITING) {
+                                async_release_inflight_batch(e.devPtr_base);
+                                e.status = UGDS_BATCH_FAILED;
+                                e.n_cmds = 0;
+                            }
+                        }
+                        bs->n_entries += nr;
+                        return make_error(UGDS_INTERNAL_ERROR);
                     } else if (++spins > max_spins) {
                         if (prp_idx != UINT16_MAX)
                             prp_pool_free(&bs->prp_pool, prp_idx);
@@ -400,8 +470,6 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                     }
                 }
 
-                slot = static_cast<uint16_t>(
-                    qp.sq.tail.load(std::memory_order_relaxed) % qp.sq.qs);
                 cmd = nvm_sq_enqueue(&qp.sq);
                 if (cmd == nullptr) {
                     if (prp_idx != UINT16_MAX)
@@ -420,8 +488,10 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
                 }
             }
 
+            uint16_t cid = bs->free_cids.back();
+            bs->free_cids.pop_back();
             memset(cmd, 0, sizeof(nvm_cmd_t));
-            nvm_cmd_header(cmd, slot, entry.opcode, hs->ns_id);
+            nvm_cmd_header(cmd, cid, entry.opcode, hs->ns_id);
 
             if (n_pages == 1) {
                 nvm_cmd_data_ptr(cmd, sc.buf_dma->ioaddrs[sc.page_start], 0);
@@ -444,7 +514,7 @@ extern "C" uGDSError_t uGDSBatchIOSubmit(uGDSBatchHandle_t batch, unsigned nr,
             size_t n_blocks = sc.chunk_size / hs->block_size;
             nvm_cmd_rw_blks(cmd, sc.lba, static_cast<uint16_t>(n_blocks));
 
-            CmdSlot& cs = bs->cmd_map[slot];
+            CmdSlot& cs = bs->cmd_map[cid];
             cs.io_idx = static_cast<uint16_t>(sc.io_idx);
             cs.chunk_bytes = sc.chunk_size;
             cs.prp_page_idx = prp_idx;
@@ -498,7 +568,10 @@ extern "C" uGDSError_t uGDSBatchIOGetStatus(uGDSBatchHandle_t batch,
         // Poll single CQ for completions
         if (bs->in_flight > 0) {
             std::lock_guard<std::mutex> qp_lock(qp.lock);
-            while (drain_one_completion(qp, bs)) {}
+            int drain_rc = 0;
+            while ((drain_rc = drain_one_completion(qp, bs)) > 0) {}
+            if (drain_rc < 0)
+                return make_error(UGDS_INTERNAL_ERROR);
         }
 
         for (unsigned i = 0; i < bs->n_entries && n_ready < max_events; ++i) {
@@ -548,7 +621,10 @@ extern "C" void uGDSBatchIODestroy(uGDSBatchHandle_t batch)
         uint64_t spins = 0;
         const uint64_t max_spins = (uint64_t)hs->ctrl->timeout * 1000000ULL;
         while (bs->in_flight > 0) {
-            if (!drain_one_completion(qp, bs)) {
+            int drain_rc = drain_one_completion(qp, bs);
+            if (drain_rc < 0) {
+                break;
+            } else if (drain_rc == 0) {
                 if (++spins > max_spins) break;
                 __builtin_ia32_pause();
             } else {

@@ -220,6 +220,7 @@ struct BatchState {
 
     std::vector<BatchIOEntry> entries;
     std::vector<CmdSlot>      cmd_map;
+    std::vector<uint16_t>     free_cids;
     uint16_t                  in_flight = 0;
     PRPPool                   prp_pool;
 
