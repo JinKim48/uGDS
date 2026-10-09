@@ -99,9 +99,11 @@ static void* sync_rw_thread(void* arg) {
         clock_gettime(CLOCK_MONOTONIC, &io_start);
 
         ssize_t result;
+        const off_t buffer_offset = data->mode == 1
+            ? static_cast<off_t>(done_bytes % data->buffer_size) : 0;
         if (data->mode == 1) {
             result = uGDSWrite(cf_handle, data->gpu_buffer, this_io,
-                                 data->offset + done_bytes, done_bytes);
+                                 data->offset + done_bytes, buffer_offset);
         } else {
             result = uGDSRead(cf_handle, data->gpu_buffer, this_io,
                                 data->offset + done_bytes, 0);
@@ -173,14 +175,16 @@ static void* batch_rw_thread(void* arg) {
             params[i].mode = CUFILE_BATCH;
             params[i].u.batch.devPtr_base = data->gpu_buffer;
             params[i].u.batch.file_offset = data->offset + done_bytes + batch_bytes;
-            params[i].u.batch.devPtr_offset = (done_bytes + batch_bytes) % data->size;
+            params[i].u.batch.devPtr_offset =
+                (done_bytes + batch_bytes) % data->buffer_size;
             params[i].u.batch.size = this_io;
             params[i].fh = cf_handle;
             params[i].opcode = data->mode ? CUFILE_WRITE : CUFILE_READ;
 #else
             params[i].devPtr_base = data->gpu_buffer;
             params[i].file_offset = data->offset + done_bytes + batch_bytes;
-            params[i].devPtr_offset = (done_bytes + batch_bytes) % data->size;
+            params[i].devPtr_offset =
+                (done_bytes + batch_bytes) % data->buffer_size;
             params[i].size = this_io;
             params[i].opcode = data->mode ? UGDS_WRITE : UGDS_READ;
 #endif
@@ -264,7 +268,7 @@ static void* async_rw_thread(void* arg) {
 
         size = this_io;
         file_off = data->offset + done_bytes;
-        buf_off = done_bytes;
+        buf_off = done_bytes % data->buffer_size;
         result = 0;
 
         clock_gettime(CLOCK_MONOTONIC, &io_start);
@@ -338,6 +342,10 @@ static void run_ugds_bench(BenchOpts& opts) {
     printf("  File:       %s\n", opts.file_path);
     printf("  Length:     %zu bytes (%.2f MB)\n", opts.length, opts.length / (double)MB);
     printf("  IO size:    %zu bytes\n", opts.io_size);
+    if (opts.buffer_size == 0)
+        printf("  Buffer cap: transfer length\n");
+    else
+        printf("  Buffer cap: %zu bytes\n", opts.buffer_size);
     printf("  Threads:    %d\n", opts.num_threads);
     printf("  IO depth:   %d\n", opts.io_depth);
     printf("  GPU:        %d\n", opts.gpu_id);
@@ -393,6 +401,8 @@ static void run_ugds_bench(BenchOpts& opts) {
         td->offset = (off_t)(i * chunk_size);
         td->size = chunk_size;
         td->io_size = opts.io_size;
+        td->buffer_size = opts.buffer_size == 0
+            ? chunk_size : std::min(opts.buffer_size, chunk_size);
         td->depth = opts.io_depth;
         td->handler = &cf_handle;
         td->total_io_time = 0;
@@ -402,11 +412,11 @@ static void run_ugds_bench(BenchOpts& opts) {
         td->wall_time_ns = 0;
         td->device_id = opts.gpu_id;
 
-        CHECK_CUDA(cudaMalloc(&td->gpu_buffer, chunk_size));
-        CHECK_CUDA(cudaMemset(td->gpu_buffer, 0x00, chunk_size));
+        CHECK_CUDA(cudaMalloc(&td->gpu_buffer, td->buffer_size));
+        CHECK_CUDA(cudaMemset(td->gpu_buffer, 0x00, td->buffer_size));
         CHECK_CUDA(cudaStreamSynchronize(0));
 
-        CHECK_UGDS(uGDSBufRegister(td->gpu_buffer, chunk_size, TEST_BUF_FLAGS),
+        CHECK_UGDS(uGDSBufRegister(td->gpu_buffer, td->buffer_size, TEST_BUF_FLAGS),
                      "uGDSBufRegister");
 
         td->latency_vec.reserve(chunk_size / opts.io_size + 10);

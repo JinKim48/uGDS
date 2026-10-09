@@ -19,6 +19,7 @@ struct BenchOpts {
     const char* file_path = nullptr;
     size_t length = 1UL * GB;
     size_t io_size = 4 * KB;
+    size_t buffer_size = 0;
     int gpu_id = 0;
     int num_threads = 1;
     int io_depth = 1;
@@ -35,6 +36,7 @@ struct ThreadData {
     off_t offset;
     size_t size;
     size_t io_size;
+    size_t buffer_size;
     size_t depth;
     void* gpu_buffer;
     void* handler;
@@ -153,6 +155,7 @@ static inline bool parse_bench_opts(int argc, char** argv, BenchOpts& opts) {
         {"file",    required_argument, nullptr, 'f'},
         {"length",  required_argument, nullptr, 'l'},
         {"size",    required_argument, nullptr, 's'},
+        {"buffer-size", required_argument, nullptr, 'b'},
         {"device",  required_argument, nullptr, 'd'},
         {"threads", required_argument, nullptr, 't'},
         {"iodepth", required_argument, nullptr, 'i'},
@@ -162,11 +165,12 @@ static inline bool parse_bench_opts(int argc, char** argv, BenchOpts& opts) {
         {nullptr, 0, nullptr, 0}
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "f:l:s:d:t:i:m:jh", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "f:l:s:b:d:t:i:m:jh", long_options, nullptr)) != -1) {
         switch (opt) {
         case 'f': opts.file_path = optarg; break;
         case 'l': opts.length = parse_size(optarg); break;
         case 's': opts.io_size = parse_size(optarg); break;
+        case 'b': opts.buffer_size = parse_size(optarg); break;
         case 'd': opts.gpu_id = atoi(optarg); break;
         case 't': opts.num_threads = atoi(optarg); break;
         case 'i': opts.io_depth = atoi(optarg); break;
@@ -180,7 +184,7 @@ static inline bool parse_bench_opts(int argc, char** argv, BenchOpts& opts) {
         case 'j': opts.json = true; break;
         case 'h':
         default:
-            fprintf(stderr, "Usage: %s -f <file> [-l length] [-s io_size] [-d gpu] [-t threads] [-i depth] [-m read|write] [-j]\n", argv[0]);
+            fprintf(stderr, "Usage: %s -f <file> [-l length] [-s io_size] [--buffer-size size] [-d gpu] [-t threads] [-i depth] [-m read|write] [-j]\n", argv[0]);
             return false;
         }
     }
@@ -202,6 +206,20 @@ static inline bool parse_bench_opts(int argc, char** argv, BenchOpts& opts) {
     }
     if (opts.length == 0) {
         fprintf(stderr, "Error: length must be > 0\n");
+        return false;
+    }
+    if (opts.buffer_size != 0 && opts.buffer_size < opts.io_size) {
+        fprintf(stderr, "Error: buffer_size must be >= io_size\n");
+        return false;
+    }
+    if (opts.is_batch && opts.buffer_size != 0 &&
+        opts.buffer_size < opts.io_size * static_cast<size_t>(opts.io_depth)) {
+        fprintf(stderr, "Error: batch buffer_size must be >= io_size * depth\n");
+        return false;
+    }
+    if (opts.is_batch && opts.buffer_size != 0 &&
+        opts.buffer_size % (opts.io_size * static_cast<size_t>(opts.io_depth)) != 0) {
+        fprintf(stderr, "Error: batch buffer_size must be a multiple of io_size * depth\n");
         return false;
     }
     return true;
