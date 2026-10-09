@@ -216,6 +216,7 @@ set(FUNCTIONAL_TESTS
     test_batch_errors
     test_batch_reuse
     test_batch_deep
+    test_batch_large_entries
     test_async_basic
     test_async_stream_order
     test_async_late_binding
