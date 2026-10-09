@@ -310,6 +310,21 @@ if(UGDS_BACKEND_CUDA)
             )
         endif()
 
+        # bench_async_multistream: one submitter, bounded independent streams/QPs
+        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/perf/bench_async_multistream.cu)
+            add_executable(bench_async_multistream${CUDA_SUFFIX}
+                test/perf/bench_async_multistream.cu)
+            target_include_directories(bench_async_multistream${CUDA_SUFFIX} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/include
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/perf
+            )
+            target_link_libraries(bench_async_multistream${CUDA_SUFFIX} ugds CUDA::cudart)
+            set_target_properties(bench_async_multistream${CUDA_SUFFIX} PROPERTIES
+                CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
+                BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+            )
+        endif()
+
         # bench_gds: NVIDIA GDS comparison (optional)
         set(CUFILE_LIB "" CACHE FILEPATH "Path to NVIDIA libcufile.so for GDS comparison benchmark")
         set(CUFILE_INCLUDE "" CACHE PATH "Path to NVIDIA cuFile headers (if different from ours)")
