@@ -176,7 +176,14 @@ int ctrl_chrdev_create(struct ctrl* ctrl, dev_t first, const struct file_operati
         return err;
     }
 
-    chrdev = device_create(ctrl->cls, NULL, ctrl->rdev, NULL, ctrl->name);
+    /*
+     * Keep the character device anchored to its PCI controller.  Besides
+     * expressing the actual lifetime/topology relationship in sysfs, this
+     * lets multi-controller users resolve /dev/ugds_drvN from an exact BDF
+     * instead of relying on probe order.
+     */
+    chrdev = device_create(ctrl->cls, &ctrl->pdev->dev, ctrl->rdev, NULL,
+                           ctrl->name);
     if (IS_ERR(chrdev))
     {
         cdev_del(ctrl->cdev);
